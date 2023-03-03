@@ -166,16 +166,16 @@ namespace
 }
 
 BackupCoordinationRemote::BackupCoordinationRemote(
-    const String & root_zookeeper_path_, const String & backup_uuid_, zkutil::GetZooKeeper get_zookeeper_, bool is_internal_)
-    : root_zookeeper_path(root_zookeeper_path_)
-    , zookeeper_path(root_zookeeper_path_ + "/backup-" + backup_uuid_)
+    BackupCoordinationStageSync::CoordinationSettings settings, const String & backup_uuid_, zkutil::GetZooKeeper get_zookeeper_, bool is_internal_)
+    : root_zookeeper_path(settings.root_zookeeper_path)
+    , zookeeper_path(settings.root_zookeeper_path + "/backup-" + backup_uuid_)
     , backup_uuid(backup_uuid_)
     , get_zookeeper(get_zookeeper_)
     , is_internal(is_internal_)
 {
     createRootNodes();
     stage_sync.emplace(
-        zookeeper_path + "/stage", [this] { return getZooKeeper(); }, &Poco::Logger::get("BackupCoordination"));
+        settings, [this] { return getZooKeeper(); }, &Poco::Logger::get("BackupCoordination"));
 }
 
 BackupCoordinationRemote::~BackupCoordinationRemote()

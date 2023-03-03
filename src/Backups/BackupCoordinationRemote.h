@@ -4,6 +4,7 @@
 #include <Backups/BackupCoordinationReplicatedAccess.h>
 #include <Backups/BackupCoordinationReplicatedTables.h>
 #include <Backups/BackupCoordinationStageSync.h>
+#include "Core/Types.h"
 
 
 namespace DB
@@ -16,7 +17,7 @@ constexpr size_t MAX_ZOOKEEPER_ATTEMPTS = 10;
 class BackupCoordinationRemote : public IBackupCoordination
 {
 public:
-    BackupCoordinationRemote(const String & root_zookeeper_path_, const String & backup_uuid_, zkutil::GetZooKeeper get_zookeeper_, bool is_internal_);
+    BackupCoordinationRemote(BackupCoordinationStageSync::CoordinationSettings settings, const String & backup_uuid_, zkutil::GetZooKeeper get_zookeeper_, bool is_internal_);
     ~BackupCoordinationRemote() override;
 
     void setStage(const String & current_host, const String & new_stage, const String & message) override;

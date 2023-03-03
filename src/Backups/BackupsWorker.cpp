@@ -38,12 +38,12 @@ namespace Stage = BackupCoordinationStage;
 
 namespace
 {
-    std::shared_ptr<IBackupCoordination> makeBackupCoordination(const String & root_zk_path, const String & backup_uuid, const ContextPtr & context, bool is_internal_backup)
+    std::shared_ptr<IBackupCoordination> makeBackupCoordination(BackupCoordinationStageSync::CoordinationSettings settings, const String & backup_uuid, const ContextPtr & context, bool is_internal_backup)
     {
-        if (!root_zk_path.empty())
+        if (!settings.root_zookeeper_path.empty())
         {
             auto get_zookeeper = [global_context = context->getGlobalContext()] { return global_context->getZooKeeper(); };
-            return std::make_shared<BackupCoordinationRemote>(root_zk_path, backup_uuid, get_zookeeper, is_internal_backup);
+            return std::make_shared<BackupCoordinationRemote>(settings.root_zookeeper_path, backup_uuid, get_zookeeper, is_internal_backup);
         }
         else
         {
@@ -168,8 +168,15 @@ OperationID BackupsWorker::startMakingBackup(const ASTPtr & query, const Context
         /// The following call of makeBackupCoordination() is not essential because doBackup() will later create a backup coordination
         /// if it's not created here. However to handle errors better it's better to make a coordination here because this way
         /// if an exception will be thrown in startMakingBackup() other hosts will know about that.
-        root_zk_path = context->getConfigRef().getString("backups.zookeeper_path", "/clickhouse/backups");
-        backup_coordination = makeBackupCoordination(root_zk_path, toString(*backup_settings.backup_uuid), context, backup_settings.internal);
+
+        BackupCoordinationStageSync::CoordinationSettings settings
+        {
+            .root_zookeeper_path = context->getConfigRef().getString("backups.zookeeper_path", "/clickhouse/backups"),
+            .max_retries = context->getSettingsRef().backup_keeper_max_retries,
+            .initial_backoff_ms = context->getSettingsRef().backup_keeper_retry_initial_backoff_ms,
+            .max_backoff_ms = context->getSettingsRef().backup_keeper_retry_max_backoff_ms,
+        };
+        backup_coordination = makeBackupCoordination(settings, toString(*backup_settings.backup_uuid), context, backup_settings.internal);
     }
 
     auto backup_info = BackupInfo::fromAST(*backup_query->backup_name);
@@ -277,7 +284,16 @@ void BackupsWorker::doBackup(
 
         /// Make a backup coordination.
         if (!backup_coordination)
-            backup_coordination = makeBackupCoordination(root_zk_path, toString(*backup_settings.backup_uuid), context, backup_settings.internal);
+        {
+            BackupCoordinationStageSync::CoordinationSettings settings
+            {
+                .root_zookeeper_path = root_zk_path,
+                .max_retries = context->getSettingsRef().backup_keeper_max_retries,
+                .initial_backoff_ms = context->getSettingsRef().backup_keeper_retry_initial_backoff_ms,
+                .max_backoff_ms = context->getSettingsRef().backup_keeper_retry_max_backoff_ms,
+            };
+            backup_coordination = makeBackupCoordination(settings, toString(*backup_settings.backup_uuid), context, backup_settings.internal);
+        }
 
         if (!allow_concurrent_backups && backup_coordination->hasConcurrentBackups(std::ref(num_active_backups)))
             throw Exception(ErrorCodes::CONCURRENT_ACCESS_NOT_SUPPORTED, "Concurrent backups not supported, turn on setting 'allow_concurrent_backups'");
