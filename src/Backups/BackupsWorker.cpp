@@ -38,12 +38,12 @@ namespace Stage = BackupCoordinationStage;
 
 namespace
 {
-    std::shared_ptr<IBackupCoordination> makeBackupCoordination(BackupCoordinationStageSync::CoordinationSettings settings, const String & backup_uuid, const ContextPtr & context, bool is_internal_backup)
+    std::shared_ptr<IBackupCoordination> makeBackupCoordination(BackupCoordinationStageSync::CoordinationSettings settings, const BackupSettings & backup_settings, const ContextPtr & context)
     {
         if (!settings.root_zookeeper_path.empty())
         {
             auto get_zookeeper = [global_context = context->getGlobalContext()] { return global_context->getZooKeeper(); };
-            return std::make_shared<BackupCoordinationRemote>(settings, backup_uuid, get_zookeeper, is_internal_backup);
+            return std::make_shared<BackupCoordinationRemote>(settings, backup_settings, get_zookeeper);
         }
         else
         {
@@ -175,8 +175,9 @@ OperationID BackupsWorker::startMakingBackup(const ASTPtr & query, const Context
             .max_retries = context->getSettingsRef().backup_keeper_max_retries,
             .initial_backoff_ms = context->getSettingsRef().backup_keeper_retry_initial_backoff_ms,
             .max_backoff_ms = context->getSettingsRef().backup_keeper_retry_max_backoff_ms,
+            .timeout_to_consider_replica_as_dead_seconds = context->getSettingsRef().backup_timeout_to_consider_replica_as_dead_seconds,
         };
-        backup_coordination = makeBackupCoordination(settings, toString(*backup_settings.backup_uuid), context, backup_settings.internal);
+        backup_coordination = makeBackupCoordination(settings, backup_settings, context);
     }
 
     auto backup_info = BackupInfo::fromAST(*backup_query->backup_name);
@@ -291,8 +292,9 @@ void BackupsWorker::doBackup(
                 .max_retries = context->getSettingsRef().backup_keeper_max_retries,
                 .initial_backoff_ms = context->getSettingsRef().backup_keeper_retry_initial_backoff_ms,
                 .max_backoff_ms = context->getSettingsRef().backup_keeper_retry_max_backoff_ms,
+                .timeout_to_consider_replica_as_dead_seconds = context->getSettingsRef().backup_timeout_to_consider_replica_as_dead_seconds,
             };
-            backup_coordination = makeBackupCoordination(settings, toString(*backup_settings.backup_uuid), context, backup_settings.internal);
+            backup_coordination = makeBackupCoordination(settings, backup_settings, context);
         }
 
         if (!allow_concurrent_backups && backup_coordination->hasConcurrentBackups(std::ref(num_active_backups)))
@@ -422,6 +424,7 @@ OperationID BackupsWorker::startRestoring(const ASTPtr & query, ContextMutablePt
             .max_retries = context->getSettingsRef().backup_keeper_max_retries,
             .initial_backoff_ms = context->getSettingsRef().backup_keeper_retry_initial_backoff_ms,
             .max_backoff_ms = context->getSettingsRef().backup_keeper_retry_max_backoff_ms,
+            .timeout_to_consider_replica_as_dead_seconds = context->getSettingsRef().backup_timeout_to_consider_replica_as_dead_seconds,
         };
         restore_coordination = makeRestoreCoordination(settings, toString(*restore_settings.restore_uuid), context, restore_settings.internal);
     }
@@ -548,6 +551,7 @@ void BackupsWorker::doRestore(
             .max_retries = context->getSettingsRef().backup_keeper_max_retries,
             .initial_backoff_ms = context->getSettingsRef().backup_keeper_retry_initial_backoff_ms,
             .max_backoff_ms = context->getSettingsRef().backup_keeper_retry_max_backoff_ms,
+            .timeout_to_consider_replica_as_dead_seconds = context->getSettingsRef().backup_timeout_to_consider_replica_as_dead_seconds,
         };
 
         /// Make a restore coordination.

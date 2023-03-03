@@ -166,12 +166,15 @@ namespace
 }
 
 BackupCoordinationRemote::BackupCoordinationRemote(
-    BackupCoordinationStageSync::CoordinationSettings settings, const String & backup_uuid_, zkutil::GetZooKeeper get_zookeeper_, bool is_internal_)
-    : root_zookeeper_path(settings.root_zookeeper_path)
-    , zookeeper_path(settings.root_zookeeper_path + "/backup-" + backup_uuid_)
-    , backup_uuid(backup_uuid_)
+    BackupCoordinationStageSync::CoordinationSettings settings,
+    const BackupSettings & backup_settings,
+    zkutil::GetZooKeeper get_zookeeper_)
+    : backup_uuid(toString(*backup_settings.backup_uuid))
+    , root_zookeeper_path(settings.root_zookeeper_path)
+    , zookeeper_path(settings.root_zookeeper_path + "/backup-" + backup_uuid)
+    , current_host(backup_settings.host_id)
     , get_zookeeper(get_zookeeper_)
-    , is_internal(is_internal_)
+    , is_internal(backup_settings.internal)
 {
     zookeeper_retries_info = ZooKeeperRetriesInfo(
         "BackupCoordinationStageSync",
@@ -216,6 +219,11 @@ zkutil::ZooKeeperPtr BackupCoordinationRemote::getZooKeeperNoLock() const
         /// so we may read a bit stale state.
         zookeeper->sync(zookeeper_path);
     }
+
+    /// Update the mtime of this node.
+    String alive_node_path = zookeeper_path + "/alive|" + current_host;
+    zookeeper->createIfNotExists(alive_node_path, "");
+    zookeeper->set(alive_node_path, "");
     return zookeeper;
 }
 
@@ -254,12 +262,12 @@ void BackupCoordinationRemote::removeAllNodes()
 }
 
 
-void BackupCoordinationRemote::setStage(const String & current_host, const String & new_stage, const String & message)
+void BackupCoordinationRemote::setStage(const String &, const String & new_stage, const String & message)
 {
     stage_sync->set(current_host, new_stage, message);
 }
 
-void BackupCoordinationRemote::setError(const String & current_host, const Exception & exception)
+void BackupCoordinationRemote::setError(const String &, const Exception & exception)
 {
     stage_sync->setError(current_host, exception);
 }
