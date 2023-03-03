@@ -962,7 +962,7 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
             else
             {
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
-                    "Expected JOIN righ table expression to be table, table function, query or union node. Actual {}",
+                    "Expected JOIN right table expression to be table, table function, query or union node. Actual {}",
                     join_right_table_expression->formatASTForErrorMessage());
             }
 
