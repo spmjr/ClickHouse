@@ -38,21 +38,17 @@ namespace ErrorCodes
 namespace
 {
 
-struct FormatDateTimeTraits
+enum class SupportInteger
 {
-    enum class SupportInteger
-    {
-        Yes,
-        No
-    };
-
-    enum class FormatSyntax
-    {
-        MySQL,
-        Joda
-    };
+    Yes,
+    No
 };
 
+enum class FormatSyntax
+{
+    MySQL,
+    Joda
+};
 
 template <typename DataType> struct ActionValueTypeMap {};
 template <> struct ActionValueTypeMap<DataTypeInt8>       { using ActionValueType = UInt32; };
@@ -120,11 +116,9 @@ constexpr std::string_view weekdaysFull[] = {"Sunday", "Monday", "Tuesday", "Wed
 
 constexpr std::string_view weekdaysShort[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
 
-constexpr std::string_view monthsFull[]
-    = {"January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"};
+constexpr std::string_view monthsFull[] = {"January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"};
 
-constexpr std::string_view monthsShort[]
-    = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+constexpr std::string_view monthsShort[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
 
 /** formatDateTime(time, 'format')
   * Performs formatting of time, according to provided format.
@@ -164,7 +158,7 @@ constexpr std::string_view monthsShort[]
   *
   * PS. We can make this function to return FixedString. Currently it returns String.
   */
-template <typename Name, FormatDateTimeTraits::SupportInteger support_integer, FormatDateTimeTraits::FormatSyntax format_syntax>
+template <typename Name, SupportInteger support_integer, FormatSyntax format_syntax>
 class FunctionFormatDateTimeImpl : public IFunction
 {
 private:
@@ -192,7 +186,7 @@ private:
         /// This is the reason why we use raw function pointer in MySQL format and std::function
         /// in Joda format.
         using Func = std::conditional_t<
-            format_syntax == FormatDateTimeTraits::FormatSyntax::MySQL,
+            format_syntax == FormatSyntax::MySQL,
             size_t (*)(char *, Time, UInt64, UInt32, const DateLUTImpl &),
             std::function<size_t(char *, Time, UInt64, UInt32, const DateLUTImpl &)>>;
 
@@ -292,7 +286,10 @@ private:
             return pos;
         }
     public:
-        static size_t mysqlNoop(char *, Time, UInt64, UInt32, const DateLUTImpl &) { return 0; }
+        static size_t mysqlNoop(char *, Time, UInt64, UInt32, const DateLUTImpl &)
+        {
+            return 0;
+        }
 
         static size_t mysqlCentury(char * dest, Time source, UInt64, UInt32, const DateLUTImpl & timezone)
         {
@@ -465,8 +462,7 @@ private:
             return writeNumber2(dest, ToSecondImpl::execute(source, timezone));
         }
 
-        static size_t
-        mysqlFractionalSecond(char * dest, Time /*source*/, UInt64 fractional_second, UInt32 scale, const DateLUTImpl & /*timezone*/)
+        static size_t mysqlFractionalSecond(char * dest, Time /*source*/, UInt64 fractional_second, UInt32 scale, const DateLUTImpl & /*timezone*/)
         {
             if (scale == 0)
                 scale = 1;
@@ -707,7 +703,7 @@ public:
 
     DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
     {
-        if constexpr (support_integer == FormatDateTimeTraits::SupportInteger::Yes)
+        if constexpr (support_integer == SupportInteger::Yes)
         {
             if (arguments.size() != 1 && arguments.size() != 2 && arguments.size() != 3)
                 throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
@@ -753,7 +749,7 @@ public:
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, [[maybe_unused]] size_t input_rows_count) const override
     {
         ColumnPtr res;
-        if constexpr (support_integer == FormatDateTimeTraits::SupportInteger::Yes)
+        if constexpr (support_integer == SupportInteger::Yes)
         {
             if (arguments.size() == 1)
             {
@@ -828,7 +824,7 @@ public:
         using T = typename ActionValueTypeMap<DataType>::ActionValueType;
         std::vector<Action<T>> instructions;
         String out_template;
-        auto result_size = parseFormat(format, instructions, scale, out_template);
+        size_t out_template_size = parseFormat(format, instructions, scale, out_template);
 
         const DateLUTImpl * time_zone_tmp = nullptr;
         if (castType(arguments[0].type.get(), [&]([[maybe_unused]] const auto & type) { return true; }))
@@ -842,26 +838,26 @@ public:
         const auto & vec = times->getData();
 
         auto col_res = ColumnString::create();
-        auto & dst_data = col_res->getChars();
-        auto & dst_offsets = col_res->getOffsets();
-        dst_data.resize(vec.size() * (result_size + 1));
-        dst_offsets.resize(vec.size());
+        auto & res_data = col_res->getChars();
+        auto & res_offsets = col_res->getOffsets();
+        res_data.resize(vec.size() * (out_template_size + 1));
+        res_offsets.resize(vec.size());
 
-        if constexpr (format_syntax == FormatDateTimeTraits::FormatSyntax::MySQL)
+        if constexpr (format_syntax == FormatSyntax::MySQL)
         {
-            /// Fill result with literals.
+            /// Fill result with template.
             {
-                UInt8 * begin = dst_data.data();
-                UInt8 * end = begin + dst_data.size();
-                UInt8 * pos = begin;
+                const UInt8 * const begin = res_data.data();
+                const UInt8 * const end = res_data.data() + res_data.size();
+                UInt8 * pos = res_data.data();
 
                 if (pos < end)
                 {
-                    memcpy(pos, out_template.data(), result_size + 1); /// With zero terminator.
-                    pos += result_size + 1;
+                    memcpy(pos, out_template.data(), out_template_size + 1); /// With zero terminator. mystring[mystring.size()] = '\0' is guaranteed since C++11.
+                    pos += out_template_size + 1;
                 }
 
-                /// Fill by copying exponential growing ranges.
+                /// Copy exponentially growing ranges.
                 while (pos < end)
                 {
                     size_t bytes_to_copy = std::min(pos - begin, end - pos);
@@ -871,7 +867,7 @@ public:
             }
         }
 
-        auto * begin = reinterpret_cast<char *>(dst_data.data());
+        auto * begin = reinterpret_cast<char *>(res_data.data());
         auto * pos = begin;
         for (size_t i = 0; i < vec.size(); ++i)
         {
@@ -879,9 +875,7 @@ public:
             {
                 const auto c = DecimalUtils::split(vec[i], scale);
                 for (auto & instruction : instructions)
-                {
                     instruction.perform(pos, static_cast<Int64>(c.whole), c.fractional, scale, time_zone);
-                }
             }
             else
             {
@@ -890,26 +884,22 @@ public:
             }
             *pos++ = '\0';
 
-            dst_offsets[i] = pos - begin;
+            res_offsets[i] = pos - begin;
         }
 
-        dst_data.resize(pos - begin);
+        res_data.resize(pos - begin);
         return col_res;
     }
 
     template <typename T>
     size_t parseFormat(const String & format, std::vector<Action<T>> & instructions, UInt32 scale, String & out_template) const
     {
-        if constexpr (format_syntax == FormatDateTimeTraits::FormatSyntax::MySQL)
+        static_assert(format_syntax == FormatSyntax::MySQL || format_syntax == FormatSyntax::Joda);
+
+        if constexpr (format_syntax == FormatSyntax::MySQL)
             return parseMySQLFormat(format, instructions, scale, out_template);
-        else if constexpr (format_syntax == FormatDateTimeTraits::FormatSyntax::Joda)
-            return parseJodaFormat(format, instructions, scale, out_template);
         else
-            throw Exception(
-                ErrorCodes::NOT_IMPLEMENTED,
-                "Unknown datetime format style {} in function {}",
-                magic_enum::enum_name(format_syntax),
-                getName());
+            return parseJodaFormat(format, instructions, scale, out_template);
     }
 
     template <typename T>
@@ -931,7 +921,7 @@ public:
         };
 
         const char * pos = format.data();
-        const char * const end = pos + format.size();
+        const char * const end = format.data() + format.size();
 
         while (true)
         {
@@ -951,13 +941,13 @@ public:
 
                 switch (*pos)
                 {
-                    // Abbreviated weekday [Mon...Sun]
+                    // Abbreviated weekday [Mon-Sun]
                     case 'a':
                         instructions.emplace_back(&Action<T>::mysqlDayOfWeekTextShort);
                         out_template += "Mon";
                         break;
 
-                    // Abbreviated month [Jan...Dec]
+                    // Abbreviated month [Jan-Dec]
                     case 'b':
                         instructions.emplace_back(&Action<T>::mysqlMonthOfYearTextShort);
                         out_template += "Jan";
@@ -995,12 +985,10 @@ public:
 
                     // Fractional seconds
                     case 'f':
-                    {
                         /// If the time data type has no fractional part, then we print '0' as the fractional part.
                         instructions.emplace_back(&Action<T>::mysqlFractionalSecond);
                         out_template += String(std::max<UInt32>(1, scale), '0');
                         break;
-                    }
 
                     // Short YYYY-MM-DD date, equivalent to %Y-%m-%d   2001-08-23
                     case 'F':
@@ -1050,7 +1038,7 @@ public:
                         out_template += "0";
                         break;
 
-                    // Full weekday [Monday...Sunday]
+                    // Full weekday [Monday-Sunday]
                     case 'W':
                         instructions.emplace_back(&Action<T>::mysqlDayOfWeekTextLong);
                         out_template += "Monday";
@@ -1222,7 +1210,7 @@ public:
 
         size_t reserve_size = 0;
         const char * pos = format.data();
-        const char * end = pos + format.size();
+        const char * end = format.data() + format.size();
 
         while (pos < end)
         {
@@ -1430,10 +1418,10 @@ struct NameFromUnixTimeInJodaSyntax
 };
 
 
-using FunctionFormatDateTime = FunctionFormatDateTimeImpl<NameFormatDateTime, FormatDateTimeTraits::SupportInteger::No, FormatDateTimeTraits::FormatSyntax::MySQL>;
-using FunctionFromUnixTimestamp = FunctionFormatDateTimeImpl<NameFromUnixTime, FormatDateTimeTraits::SupportInteger::Yes, FormatDateTimeTraits::FormatSyntax::MySQL>;
-using FunctionFormatDateTimeInJodaSyntax = FunctionFormatDateTimeImpl<NameFormatDateTimeInJodaSyntax, FormatDateTimeTraits::SupportInteger::No, FormatDateTimeTraits::FormatSyntax::Joda>;
-using FunctionFromUnixTimestampInJodaSyntax = FunctionFormatDateTimeImpl<NameFromUnixTimeInJodaSyntax, FormatDateTimeTraits::SupportInteger::Yes, FormatDateTimeTraits::FormatSyntax::Joda>;
+using FunctionFormatDateTime = FunctionFormatDateTimeImpl<NameFormatDateTime, SupportInteger::No, FormatSyntax::MySQL>;
+using FunctionFromUnixTimestamp = FunctionFormatDateTimeImpl<NameFromUnixTime, SupportInteger::Yes, FormatSyntax::MySQL>;
+using FunctionFormatDateTimeInJodaSyntax = FunctionFormatDateTimeImpl<NameFormatDateTimeInJodaSyntax, SupportInteger::No, FormatSyntax::Joda>;
+using FunctionFromUnixTimestampInJodaSyntax = FunctionFormatDateTimeImpl<NameFromUnixTimeInJodaSyntax, SupportInteger::Yes, FormatSyntax::Joda>;
 
 }
 
