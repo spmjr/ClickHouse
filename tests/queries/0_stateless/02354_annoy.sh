@@ -46,7 +46,7 @@ LIMIT 3;
 SELECT *
 FROM 02354_annoy_l2
 ORDER BY L2Distance(embedding, [0.0, 0.0])
-LIMIT 3; -- { serverError 80 }
+LIMIT 3; -- { serverError 190 }
 
 
 DROP TABLE IF EXISTS 02354_annoy_l2;
