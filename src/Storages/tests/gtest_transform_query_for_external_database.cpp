@@ -9,11 +9,15 @@
 #include <DataTypes/DataTypeString.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/TreeRewriter.h>
+#include <Interpreters/InterpreterSelectQueryAnalyzer.h>
 #include <Databases/DatabaseMemory.h>
 #include <Storages/StorageMemory.h>
 #include <Common/tests/gtest_global_context.h>
 #include <Common/tests/gtest_global_register.h>
 
+#include <Analyzer/QueryNode.h>
+#include <Analyzer/TableNode.h>
+#include <Analyzer/JoinNode.h>
 
 using namespace DB;
 
@@ -31,9 +35,9 @@ struct State
         return state;
     }
 
-    const NamesAndTypesList & getColumns() const
+    const NamesAndTypesList & getColumns(size_t idx = 0) const
     {
-        return tables[0].columns;
+        return tables[idx].columns;
     }
 
     std::vector<TableWithColumnNamesAndTypes> getTables(size_t num = 0) const
@@ -46,10 +50,10 @@ struct State
 
 private:
 
-    static DatabaseAndTableWithAlias createDBAndTable(String table_name)
+    static DatabaseAndTableWithAlias createDBAndTable(String table_name, String database_name = "test")
     {
         DatabaseAndTableWithAlias res;
-        res.database = "test";
+        res.database = database_name;
         res.table = table_name;
         return res;
     }
@@ -75,12 +79,18 @@ private:
                 {"num", std::make_shared<DataTypeUInt8>()},
                 {"attr", std::make_shared<DataTypeString>()},
             }),
+        TableWithColumnNamesAndTypes(
+            createDBAndTable("external_table"),
+            {
+                {"ttt", std::make_shared<DataTypeUInt8>()},
+            }),
     };
 
     explicit State()
         : context(Context::createCopy(getContext().context))
     {
         tryRegisterFunctions();
+        tryRegisterAggregateFunctions();
         DatabasePtr database = std::make_shared<DatabaseMemory>("test", context);
 
         for (const auto & tab : tables)
@@ -91,14 +101,28 @@ private:
                 context,
                 table_name,
                 std::make_shared<StorageMemory>(
-                    StorageID(db_name, table_name), ColumnsDescription{getColumns()}, ConstraintsDescription{}, String{}));
+                    StorageID(db_name, table_name), ColumnsDescription{tab.columns}, ConstraintsDescription{}, String{}));
         }
         DatabaseCatalog::instance().attachDatabase(database->getDatabaseName(), database);
+        // DatabaseCatalog::instance().attachDatabase("system", mockSystemDatabase());
+
         context->setCurrentDatabase("test");
+    }
+
+    DatabasePtr mockSystemDatabase()
+    {
+        DatabasePtr database = std::make_shared<DatabaseMemory>("system", context);
+        auto tab = TableWithColumnNamesAndTypes(createDBAndTable("one", "system"), { {"dummy", std::make_shared<DataTypeUInt8>()} });
+        database->attachTable(context, tab.table.table,
+            std::make_shared<StorageMemory>(
+                StorageID(tab.table.database, tab.table.table),
+                ColumnsDescription{tab.columns}, ConstraintsDescription{}, String{}));
+
+        return database;
     }
 };
 
-static void check(
+static void checkOld(
     const State & state,
     size_t table_num,
     const std::string & query,
@@ -109,14 +133,74 @@ static void check(
     SelectQueryInfo query_info;
     SelectQueryOptions select_options;
     query_info.syntax_analyzer_result
-        = TreeRewriter(state.context).analyzeSelect(ast, DB::TreeRewriterResult(state.getColumns()), select_options, state.getTables(table_num));
+        = TreeRewriter(state.context).analyzeSelect(ast, DB::TreeRewriterResult(state.getColumns(0)), select_options, state.getTables(table_num));
     query_info.query = ast;
     std::string transformed_query = transformQueryForExternalDatabase(
-        query_info, state.getColumns(), IdentifierQuotingStyle::DoubleQuotes, "test", "table", state.context);
+        query_info, state.getColumns(0), IdentifierQuotingStyle::DoubleQuotes, "test", "table", state.context);
 
     EXPECT_EQ(transformed_query, expected) << query;
 }
 
+/// Required for transformQueryForExternalDatabase. In real life table expression is calculated via planner.
+/// But in tests we can just find it in JOIN TREE.
+static QueryTreeNodePtr findTableExpression(const QueryTreeNodePtr & node, const String & table_name)
+{
+    if (node->getNodeType() == QueryTreeNodeType::TABLE)
+    {
+        if (node->as<TableNode>()->getStorageID().table_name == table_name)
+            return node;
+    }
+
+    if (node->getNodeType() == QueryTreeNodeType::JOIN)
+    {
+        if (auto res = findTableExpression(node->as<JoinNode>()->getLeftTableExpression(), table_name))
+            return res;
+        if (auto res = findTableExpression(node->as<JoinNode>()->getRightTableExpression(), table_name))
+            return res;
+    }
+    return nullptr;
+}
+
+static void checkNewAnalyzer(
+    const State & state,
+    const std::string & query,
+    const std::string & expected)
+{
+    ParserSelectQuery parser;
+    ASTPtr ast = parseQuery(parser, query, 1000, 1000);
+
+    SelectQueryOptions select_options;
+    InterpreterSelectQueryAnalyzer interpreter(ast, state.context, select_options);
+    SelectQueryInfo query_info = interpreter.getSelectQueryInfo();
+    const auto * query_node = query_info.query_tree->as<QueryNode>();
+    if (!query_node)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "QueryNode expected");
+
+    query_info.table_expression = findTableExpression(query_node->getJoinTree(), "table");
+
+    std::string transformed_query = transformQueryForExternalDatabase(
+        query_info, state.getColumns(0), IdentifierQuotingStyle::DoubleQuotes, "test", "table", state.context);
+
+    EXPECT_EQ(transformed_query, expected) << query;
+}
+
+static void check(
+    const State & state,
+    size_t table_num,
+    const std::string & query,
+    const std::string & expected,
+    const std::string & expected_new = "")
+{
+    {
+        SCOPED_TRACE("Old analyzer");
+        checkOld(state, table_num, query, expected);
+    }
+
+    {
+        SCOPED_TRACE("New analyzer");
+        checkNewAnalyzer(state, query, expected_new.empty() ? expected : expected_new);
+    }
+}
 
 TEST(TransformQueryForExternalDatabase, InWithSingleElement)
 {
@@ -124,13 +208,14 @@ TEST(TransformQueryForExternalDatabase, InWithSingleElement)
 
     check(state, 1,
           "SELECT column FROM test.table WHERE 1 IN (1)",
-          R"(SELECT "column" FROM "test"."table" WHERE 1 = 1)");
+          R"(SELECT "column" FROM "test"."table" WHERE 1 = 1)",
+          R"(SELECT "column" FROM "test"."table")");
     check(state, 1,
           "SELECT column FROM test.table WHERE column IN (1, 2)",
           R"(SELECT "column" FROM "test"."table" WHERE "column" IN (1, 2))");
     check(state, 1,
-          "SELECT column FROM test.table WHERE column NOT IN ('hello', 'world')",
-          R"(SELECT "column" FROM "test"."table" WHERE "column" NOT IN ('hello', 'world'))");
+          "SELECT field FROM test.table WHERE field NOT IN ('hello', 'world')",
+          R"(SELECT "field" FROM "test"."table" WHERE "field" NOT IN ('hello', 'world'))");
 }
 
 TEST(TransformQueryForExternalDatabase, InWithMultipleColumns)
@@ -139,7 +224,8 @@ TEST(TransformQueryForExternalDatabase, InWithMultipleColumns)
 
     check(state, 1,
           "SELECT column FROM test.table WHERE (1,1) IN ((1,1))",
-          R"(SELECT "column" FROM "test"."table" WHERE 1 = 1)");
+          R"(SELECT "column" FROM "test"."table" WHERE 1 = 1)",
+          R"(SELECT "column" FROM "test"."table")");
     check(state, 1,
           "SELECT field, value FROM test.table WHERE (field, value) IN (('foo', 'bar'))",
           R"(SELECT "field", "value" FROM "test"."table" WHERE ("field", "value") IN (('foo', 'bar')))");
@@ -153,13 +239,13 @@ TEST(TransformQueryForExternalDatabase, InWithTable)
           "SELECT column FROM test.table WHERE 1 IN external_table",
           R"(SELECT "column" FROM "test"."table")");
     check(state, 1,
-          "SELECT column FROM test.table WHERE 1 IN (x)",
+          "WITH x as (SELECT * FROM external_table) SELECT column FROM test.table WHERE 1 IN (x)",
           R"(SELECT "column" FROM "test"."table")");
     check(state, 1,
-          "SELECT column, field, value FROM test.table WHERE column IN (field, value)",
-          R"(SELECT "column", "field", "value" FROM "test"."table" WHERE "column" IN ("field", "value"))");
+          "SELECT column, field, value FROM test.table WHERE column IN (1, 2)",
+          R"(SELECT "column", "field", "value" FROM "test"."table" WHERE "column" IN (1, 2))");
     check(state, 1,
-          "SELECT column FROM test.table WHERE column NOT IN hello AND column = 123",
+          "SELECT column FROM test.table WHERE column NOT IN external_table AND column = 123",
           R"(SELECT "column" FROM "test"."table" WHERE "column" = 123)");
 }
 
@@ -168,11 +254,11 @@ TEST(TransformQueryForExternalDatabase, Like)
     const State & state = State::instance();
 
     check(state, 1,
-          "SELECT column FROM test.table WHERE column LIKE '%hello%'",
-          R"(SELECT "column" FROM "test"."table" WHERE "column" LIKE '%hello%')");
+          "SELECT field FROM test.table WHERE field LIKE '%hello%'",
+          R"(SELECT "field" FROM "test"."table" WHERE "field" LIKE '%hello%')");
     check(state, 1,
-          "SELECT column FROM test.table WHERE column NOT LIKE 'w%rld'",
-          R"(SELECT "column" FROM "test"."table" WHERE "column" NOT LIKE 'w%rld')");
+          "SELECT field FROM test.table WHERE field NOT LIKE 'w%rld'",
+          R"(SELECT "field" FROM "test"."table" WHERE "field" NOT LIKE 'w%rld')");
 }
 
 TEST(TransformQueryForExternalDatabase, Substring)
@@ -180,8 +266,8 @@ TEST(TransformQueryForExternalDatabase, Substring)
     const State & state = State::instance();
 
     check(state, 1,
-          "SELECT column FROM test.table WHERE left(column, 10) = RIGHT(column, 10) AND SUBSTRING(column FROM 1 FOR 2) = 'Hello'",
-          R"(SELECT "column" FROM "test"."table")");
+          "SELECT field FROM test.table WHERE left(field, 10) = RIGHT(field, 10) AND SUBSTRING(field FROM 1 FOR 2) = 'Hello'",
+          R"(SELECT "field" FROM "test"."table")");
 }
 
 TEST(TransformQueryForExternalDatabase, MultipleAndSubqueries)
@@ -189,10 +275,10 @@ TEST(TransformQueryForExternalDatabase, MultipleAndSubqueries)
     const State & state = State::instance();
 
     check(state, 1,
-          "SELECT column FROM test.table WHERE 1 = 1 AND toString(column) = '42' AND column = 42 AND left(column, 10) = RIGHT(column, 10) AND column IN (1, 42) AND SUBSTRING(column FROM 1 FOR 2) = 'Hello' AND column != 4",
+          "SELECT column FROM test.table WHERE 1 = 1 AND toString(column) = '42' AND column = 42 AND left(toString(column), 10) = RIGHT(toString(column), 10) AND column IN (1, 42) AND SUBSTRING(toString(column) FROM 1 FOR 2) = 'Hello' AND column != 4",
           R"(SELECT "column" FROM "test"."table" WHERE 1 AND ("column" = 42) AND ("column" IN (1, 42)) AND ("column" != 4))");
     check(state, 1,
-          "SELECT column FROM test.table WHERE toString(column) = '42' AND left(column, 10) = RIGHT(column, 10) AND column = 42",
+          "SELECT column FROM test.table WHERE toString(column) = '42' AND left(toString(column), 10) = RIGHT(toString(column), 10) AND column = 42",
           R"(SELECT "column" FROM "test"."table" WHERE "column" = 42)");
 }
 
@@ -210,7 +296,7 @@ TEST(TransformQueryForExternalDatabase, Aliases)
     const State & state = State::instance();
 
     check(state, 1,
-          "SELECT field AS value, field AS display WHERE field NOT IN ('') AND display LIKE '%test%'",
+          "SELECT field AS value, field AS display FROM table WHERE field NOT IN ('') AND display LIKE '%test%'",
           R"(SELECT "field" FROM "test"."table" WHERE ("field" NOT IN ('')) AND ("field" LIKE '%test%'))");
 }
 
@@ -221,7 +307,7 @@ TEST(TransformQueryForExternalDatabase, ForeignColumnInWhere)
     check(state, 2,
           "SELECT column FROM test.table "
           "JOIN test.table2 AS table2 ON (test.table.apply_id = table2.num) "
-          "WHERE column > 2 AND (apply_id = 1 OR table2.num = 1) AND table2.attr != ''",
+          "WHERE column > 2 AND apply_id = 1 AND table2.num = 1 AND table2.attr != ''",
           R"(SELECT "column", "apply_id" FROM "test"."table" WHERE ("column" > 2) AND ("apply_id" = 1))");
 }
 
@@ -281,4 +367,21 @@ TEST(TransformQueryForExternalDatabase, ToDate)
     check(state, 1,
         "SELECT foo FROM table WHERE a=10 AND b=toDate('2019-10-05')",
         R"(SELECT "a", "b", "foo" FROM "test"."table" WHERE ("a" = 10) AND ("b" = '2019-10-05'))");
+}
+
+TEST(TransformQueryForExternalDatabase, Analyzer)
+{
+    const State & state = State::instance();
+
+    check(state, 1,
+        "SELECT count() FROM table WHERE field LIKE '%name_%'",
+        R"(SELECT "field" FROM "test"."table" WHERE "field" LIKE '%name_%')");
+
+    check(state, 1,
+        "SELECT sleepEachRow(1) FROM table",
+        R"(SELECT "column" FROM "test"."table")");
+
+    check(state, 1,
+        "SELECT * FROM table WHERE (column) IN (1)",
+        R"(SELECT "column", "apply_id", "apply_type", "apply_status", "create_time", "field", "value", "a", "b", "foo" FROM "test"."table" WHERE "column" IN (1))");
 }

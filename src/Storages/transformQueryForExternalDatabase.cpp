@@ -14,6 +14,8 @@
 #include <Storages/transformQueryForExternalDatabase.h>
 #include <Storages/MergeTree/KeyCondition.h>
 
+#include <Storages/transformQueryForExternalDatabaseAnalyzer.h>
+
 
 namespace DB
 {
@@ -108,9 +110,9 @@ void dropAliases(ASTPtr & node)
 }
 
 
-bool isCompatible(IAST & node)
+bool isCompatible(ASTPtr & node)
 {
-    if (auto * function = node.as<ASTFunction>())
+    if (auto * function = node->as<ASTFunction>())
     {
         if (function->parameters)   /// Parametric aggregate functions
             return false;
@@ -154,20 +156,29 @@ bool isCompatible(IAST & node)
             && (function->arguments->children.size() != 2 || function->arguments->children[1]->as<ASTTableIdentifier>()))
             return false;
 
-        for (const auto & expr : function->arguments->children)
-            if (!isCompatible(*expr))
+        for (auto & expr : function->arguments->children)
+            if (!isCompatible(expr))
                 return false;
 
         return true;
     }
 
-    if (const auto * literal = node.as<ASTLiteral>())
+    if (const auto * literal = node->as<ASTLiteral>())
     {
+        if (literal->value.getType() == Field::Types::Tuple)
+        {
+            auto tuple_value = literal->value.safeGet<Tuple>();
+            if (tuple_value.size() == 1)
+            {
+                node = makeASTFunction("", std::make_shared<ASTLiteral>(tuple_value[0]));
+                return true;
+            }
+        }
         /// Foreign databases often have no support for Array. But Tuple literals are passed to support IN clause.
         return literal->value.getType() != Field::Types::Array;
     }
 
-    return node.as<ASTIdentifier>();
+    return node->as<ASTIdentifier>();
 }
 
 bool removeUnknownSubexpressions(ASTPtr & node, const NameSet & known_names);
@@ -241,23 +252,15 @@ bool removeUnknownSubexpressionsFromWhere(ASTPtr & node, const NamesAndTypesList
     return removeUnknownSubexpressions(node, known_names);
 }
 
-}
-
-String transformQueryForExternalDatabase(
-    const SelectQueryInfo & query_info,
+String transformQueryForExternalDatabaseImpl(
+    ASTPtr clone_query,
+    Names used_columns,
     const NamesAndTypesList & available_columns,
     IdentifierQuotingStyle identifier_quoting_style,
     const String & database,
     const String & table,
     ContextPtr context)
 {
-    auto clone_query = query_info.query->clone();
-
-    /// TODO: Analyzer syntax analyzer result
-    if (!query_info.syntax_analyzer_result)
-        throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "transform query for external database is unsupported");
-
-    const Names used_columns = query_info.syntax_analyzer_result->requiredSourceColumns();
     bool strict = context->getSettingsRef().external_table_strict_query;
 
     auto select = std::make_shared<ASTSelectQuery>();
@@ -278,11 +281,12 @@ String transformQueryForExternalDatabase(
 
     ASTPtr original_where = clone_query->as<ASTSelectQuery &>().where();
     bool where_has_known_columns = removeUnknownSubexpressionsFromWhere(original_where, available_columns);
+
     if (original_where && where_has_known_columns)
     {
         replaceConstantExpressions(original_where, context, available_columns);
 
-        if (isCompatible(*original_where))
+        if (isCompatible(original_where))
         {
             select->setExpression(ASTSelectQuery::Expression::WHERE, std::move(original_where));
         }
@@ -290,14 +294,14 @@ String transformQueryForExternalDatabase(
         {
             throw Exception(ErrorCodes::INCORRECT_QUERY, "Query contains non-compatible expressions (and external_table_strict_query=true)");
         }
-        else if (const auto * function = original_where->as<ASTFunction>())
+        else if (auto * function = original_where->as<ASTFunction>())
         {
             if (function->name == "and")
             {
                 auto new_function_and = makeASTFunction("and");
-                for (const auto & elem : function->arguments->children)
+                for (auto & elem : function->arguments->children)
                 {
-                    if (isCompatible(*elem))
+                    if (isCompatible(elem))
                         new_function_and->arguments->children.push_back(elem);
                 }
                 if (new_function_and->arguments->children.size() == 1)
@@ -309,7 +313,8 @@ String transformQueryForExternalDatabase(
     }
     else if (strict && original_where)
     {
-        throw Exception(ErrorCodes::INCORRECT_QUERY, "Query contains non-compatible expressions (and external_table_strict_query=true)");
+        throw Exception(ErrorCodes::INCORRECT_QUERY, "Query contains non-compatible expressions '{}' (and external_table_strict_query=true)",
+                        original_where->formatForErrorMessage());
     }
 
     auto * literal_expr = typeid_cast<ASTLiteral *>(original_where.get());
@@ -335,6 +340,84 @@ String transformQueryForExternalDatabase(
     select->format(settings);
 
     return out.str();
+}
+
+}
+
+String transformQueryForExternalDatabase(
+    const SelectQueryInfo & query_info,
+    const NamesAndTypesList & available_columns,
+    IdentifierQuotingStyle identifier_quoting_style,
+    const String & database,
+    const String & table,
+    ContextPtr context)
+{
+    if (!query_info.syntax_analyzer_result)
+    {
+        if (!query_info.query_tree)
+            throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "Query is not analyzed: no query tree");
+        if (!query_info.planner_context)
+            throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "Query is not analyzed: no planner context");
+        if (!query_info.table_expression)
+            throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "Query is not analyzed: no table expression");
+
+        const auto & table_expression_data = query_info.planner_context->getTableExpressionDataOrThrow(query_info.table_expression);
+        Names used_columns;
+        const auto & column_indentifiers_map = table_expression_data.getColumnIdentifierToColumnName();
+        for (const auto & [_, name] : column_indentifiers_map)
+            used_columns.push_back(name);
+
+        /// sort used_columns according to available_columns
+        {
+            std::unordered_map<std::string_view, size_t> available_columns_pos;
+            auto available_columns_it = available_columns.begin();
+            for (size_t i = 0; i < available_columns.size(); ++i, ++available_columns_it)
+                available_columns_pos[available_columns_it->name] = i;
+
+            std::sort(used_columns.begin(), used_columns.end(), [&available_columns_pos] (const auto & a, const auto & b)
+            {
+                auto it_a = available_columns_pos.find(a);
+                auto it_b = available_columns_pos.find(b);
+                if (it_a == available_columns_pos.end() && it_b == available_columns_pos.end())
+                    return a < b;
+                if (it_a == available_columns_pos.end())
+                    return false;
+                if (it_b == available_columns_pos.end())
+                    return true;
+                return it_a->second < it_b->second;
+            });
+        }
+
+        if (used_columns.empty() && available_columns.empty())
+            throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "Cannot find columns from '{}.{}' in query '{}'",
+                            database, table, query_info.query_tree->formatASTForErrorMessage());
+
+        if (used_columns.empty())
+            used_columns.push_back(available_columns.front().name);
+
+        auto clone_query = getASTForExternalDatabaseFromQueryTree(query_info.query_tree);
+
+        auto res = transformQueryForExternalDatabaseImpl(
+            clone_query,
+            used_columns,
+            available_columns,
+            identifier_quoting_style,
+            database,
+            table,
+            context);
+        return res;
+    }
+
+    auto clone_query = query_info.query->clone();
+    Names used_columns = query_info.syntax_analyzer_result->requiredSourceColumns();
+    return transformQueryForExternalDatabaseImpl(
+        clone_query,
+        used_columns,
+        available_columns,
+        identifier_quoting_style,
+        database,
+        table,
+        context);
 }
 
 }

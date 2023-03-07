@@ -102,6 +102,11 @@ public:
       */
     QueryTreeNodePtr getColumnSource() const;
 
+    void dropColumnSource()
+    {
+        getSourceWeakPointer().reset();
+    }
+
     /** Get column source.
       * If column source is not valid null is returned.
       */
@@ -126,7 +131,7 @@ protected:
 
     QueryTreeNodePtr cloneImpl() const override;
 
-    ASTPtr toASTImpl() const override;
+    ASTPtr toASTImpl(ConvertToASTOptions options) const override;
 
 private:
     const QueryTreeNodeWeakPtr & getSourceWeakPointer() const
