@@ -2,17 +2,17 @@
 
 #include <memory>
 
+#include <Formats/MarkInCompressedFile.h>
+#include <Interpreters/AggregationCommon.h>
 #include <Common/CacheBase.h>
 #include <Common/ProfileEvents.h>
 #include <Common/SipHash.h>
-#include <Interpreters/AggregationCommon.h>
-#include <Formats/MarkInCompressedFile.h>
 
 
 namespace ProfileEvents
 {
-    extern const Event MarkCacheHits;
-    extern const Event MarkCacheMisses;
+extern const Event MarkCacheHits;
+extern const Event MarkCacheMisses;
 }
 
 namespace DB
@@ -24,10 +24,7 @@ struct MarksWeightFunction
     /// We spent additional bytes on key in hashmap, linked lists, shared pointers, etc ...
     static constexpr size_t MARK_CACHE_OVERHEAD = 128;
 
-    size_t operator()(const MarksInCompressedFile & marks) const
-    {
-        return marks.size() * sizeof(MarkInCompressedFile) + MARK_CACHE_OVERHEAD;
-    }
+    size_t operator()(const MarksInCompressedFile & marks) const { return marks.approximate_memory_usage + MARK_CACHE_OVERHEAD; }
 };
 
 
@@ -40,8 +37,7 @@ private:
     using Base = CacheBase<UInt128, MarksInCompressedFile, UInt128TrivialHash, MarksWeightFunction>;
 
 public:
-    explicit MarkCache(size_t max_size_in_bytes, const String & mark_cache_policy = "")
-        : Base(max_size_in_bytes, 0, mark_cache_policy) {}
+    explicit MarkCache(size_t max_size_in_bytes, const String & mark_cache_policy = "") : Base(max_size_in_bytes, 0, mark_cache_policy) { }
 
     /// Calculate key from path to file and offset.
     static UInt128 hash(const String & path_to_file)

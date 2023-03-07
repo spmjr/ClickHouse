@@ -15,6 +15,8 @@ namespace ProfileEvents
 {
     extern const Event WaitMarksLoadMicroseconds;
     extern const Event BackgroundLoadingMarksTasks;
+    extern const Event LoadedMarksCount;
+    extern const Event LoadedMarksMemoryBytes;
 }
 
 namespace DB
@@ -62,7 +64,7 @@ MergeTreeMarksLoader::~MergeTreeMarksLoader()
 }
 
 
-const MarkInCompressedFile & MergeTreeMarksLoader::getMark(size_t row_index, size_t column_index)
+MarkInCompressedFile MergeTreeMarksLoader::getMark(size_t row_index, size_t column_index)
 {
     if (!marks)
     {
@@ -87,7 +89,7 @@ const MarkInCompressedFile & MergeTreeMarksLoader::getMark(size_t row_index, siz
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Column index: {} is out of range [0, {})", column_index, columns_in_mark);
 #endif
 
-    return (*marks)[row_index * columns_in_mark + column_index];
+    return marks->columns[column_index].get(row_index);
 }
 
 
@@ -100,7 +102,11 @@ MarkCache::MappedPtr MergeTreeMarksLoader::loadMarksImpl()
     size_t mark_size = index_granularity_info.getMarkSizeInBytes(columns_in_mark);
     size_t expected_uncompressed_size = mark_size * marks_count;
 
-    auto res = std::make_shared<MarksInCompressedFile>(marks_count * columns_in_mark);
+    // We first read the marks into a temporary simple array, then compress them into a more compact
+    // representation.
+    PODArray<MarkInCompressedFile> plain_marks(marks_count * columns_in_mark); // temporary
+    auto res = std::make_shared<MarksInCompressedFile>(); // compressed
+    res->columns.reserve_exact(columns_in_mark);
 
     if (!index_granularity_info.mark_type.compressed && expected_uncompressed_size != file_size)
         throw Exception(
@@ -119,12 +125,14 @@ MarkCache::MappedPtr MergeTreeMarksLoader::loadMarksImpl()
     if (!index_granularity_info.mark_type.adaptive)
     {
         /// Read directly to marks.
-        reader->readStrict(reinterpret_cast<char *>(res->data()), expected_uncompressed_size);
+        reader->readStrict(reinterpret_cast<char *>(plain_marks.data()), expected_uncompressed_size);
 
         if (!reader->eof())
             throw Exception(ErrorCodes::CANNOT_READ_ALL_DATA,
                 "Cannot read all marks from file {}, is eof: {}, buffer size: {}, file size: {}",
                 mrk_path, reader->eof(), reader->buffer().size(), file_size);
+        
+        res->columns.emplace_back(plain_marks, /* base */ 0, /* stride */ 1, marks_count);
     }
     else
     {
@@ -132,16 +140,25 @@ MarkCache::MappedPtr MergeTreeMarksLoader::loadMarksImpl()
         size_t granularity;
         while (!reader->eof())
         {
-            res->read(*reader, i * columns_in_mark, columns_in_mark);
+            reader->readStrict(
+                reinterpret_cast<char *>(plain_marks.data() + i * columns_in_mark), columns_in_mark * sizeof(MarkInCompressedFile));
             readIntBinary(granularity, *reader);
             ++i;
         }
 
         if (i * mark_size != expected_uncompressed_size)
             throw Exception(ErrorCodes::CANNOT_READ_ALL_DATA, "Cannot read all marks from file {}", mrk_path);
+
+        // Transpose the array to compress marks for each column separately, for better compression.
+        for (size_t col = 0; col < columns_in_mark; ++col)
+            res->columns.emplace_back(plain_marks, col, columns_in_mark, marks_count);
     }
 
-    res->protect();
+    res->updateApproximateMemoryUsage();
+
+    ProfileEvents::increment(ProfileEvents::LoadedMarksCount, marks_count * columns_in_mark);
+    ProfileEvents::increment(ProfileEvents::LoadedMarksMemoryBytes, res->approximate_memory_usage);
+
     return res;
 }
 
