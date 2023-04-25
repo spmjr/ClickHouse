@@ -18,3 +18,6 @@ SELECT toTypeName(today() - 1) = 'Date';
 SELECT yesterday() + 1 = today();
 SELECT 1 + yesterday() = today();
 SELECT today() - 1 = yesterday();
+SELECT toTypeName(year()) = 'UInt16';
+SELECT year() = year(today());
+SELECT year() = year(now());
